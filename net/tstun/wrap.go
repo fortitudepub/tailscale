@@ -166,6 +166,11 @@ type Wrapper struct {
 
 	// disableTSMPRejected disables TSMP rejected responses. For tests.
 	disableTSMPRejected bool
+
+	stats struct {
+		sync.Mutex
+		NetworkTrafficStats
+	}
 }
 
 // tunReadResult is the result of a TUN read, or an injected result pretending to be a TUN read.
@@ -544,6 +549,22 @@ func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
 	defer parsedPacketPool.Put(p)
 	p.Decode(buf[offset : offset+n])
 
+	if true { // TODO
+		t.stats.Lock()
+		if t.stats.VirtualTraffic == nil {
+			t.stats.VirtualTraffic = make(map[NetworkConnection]*NetworkTraffic)
+		}
+		conn := NetworkConnection{p.IPProto, p.Src, p.Dst}
+		connStats := t.stats.VirtualTraffic[conn]
+		if connStats == nil {
+			connStats = new(NetworkTraffic)
+			t.stats.VirtualTraffic[conn] = connStats
+		}
+		connStats.TxPackets += 1
+		connStats.TxBytes += uint64(n)
+		t.stats.Unlock()
+	}
+
 	if m := t.destIPActivity.Load(); m != nil {
 		if fn := m[p.Dst.Addr()]; fn != nil {
 			fn()
@@ -664,6 +685,26 @@ func (t *Wrapper) filterIn(buf []byte) filter.Response {
 // Write accepts an incoming packet. The packet begins at buf[offset:],
 // like wireguard-go/tun.Device.Write.
 func (t *Wrapper) Write(buf []byte, offset int) (int, error) {
+	if true { // TODO
+		p := parsedPacketPool.Get().(*packet.Parsed)
+		defer parsedPacketPool.Put(p)
+		p.Decode(buf[offset:])
+
+		t.stats.Lock()
+		if t.stats.VirtualTraffic == nil {
+			t.stats.VirtualTraffic = make(map[NetworkConnection]*NetworkTraffic)
+		}
+		conn := NetworkConnection{p.IPProto, p.Dst, p.Src}
+		connStats := t.stats.VirtualTraffic[conn]
+		if connStats == nil {
+			connStats = new(NetworkTraffic)
+			t.stats.VirtualTraffic[conn] = connStats
+		}
+		connStats.RxPackets += 1
+		connStats.RxBytes += uint64(len(buf[offset:]))
+		t.stats.Unlock()
+	}
+
 	metricPacketIn.Add(1)
 	if !t.disableFilter {
 		if t.filterIn(buf[offset:]) != filter.Accept {
@@ -827,6 +868,14 @@ func (t *Wrapper) InjectOutboundPacketBuffer(packet *stack.PacketBuffer) error {
 // Unwrap returns the underlying tun.Device.
 func (t *Wrapper) Unwrap() tun.Device {
 	return t.tdev
+}
+
+func (t *Wrapper) ExtractStats() (out NetworkTrafficStats) {
+	t.stats.Lock()
+	defer t.stats.Unlock()
+	out.VirtualTraffic = t.stats.VirtualTraffic
+	t.stats.VirtualTraffic = nil
+	return out
 }
 
 var (

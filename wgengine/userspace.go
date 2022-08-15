@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	crand "crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,9 +18,12 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"go4.org/mem"
+	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"tailscale.com/control/controlclient"
@@ -456,8 +460,103 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 
 	go e.pollResolver()
 
+	go networkLogger(e.tundev, e.logf)
+	// go networkLogger(e.wgdev, e.logf)
+
 	e.logf("Engine created.")
 	return e, nil
+}
+
+func networkLogger(tundev *tstun.Wrapper, logf logger.Logf) {
+	start := time.Now().UTC()
+	for now := range time.Tick(5 * time.Second) {
+		now = now.UTC()
+
+		stats := tundev.ExtractStats()
+		stats.StartTime = start
+		stats.EndTime = now
+
+		// Filter out subnet traffic for privacy reasons.
+		// TODO: This is dirty and wrong. Fix this.
+		isTailscaleIP := func(addr netip.Addr) bool {
+			return addr.Is4() && addr.As4()[0] == 100
+		}
+		var numSubnet int
+		for conn := range stats.VirtualTraffic {
+			if !isTailscaleIP(conn.Source.Addr()) || !isTailscaleIP(conn.Source.Addr()) {
+				delete(stats.VirtualTraffic, conn)
+				numSubnet++
+			}
+		}
+		if numSubnet > 0 {
+			logf("filtered out statistics for %d subnet connection", numSubnet)
+		}
+
+		b, err := json.Marshal(stats)
+		if err != nil {
+			logf("NETLOG: %v", err)
+		} else {
+			logf("NETLOG: %s", b)
+		}
+
+		start = now
+	}
+}
+
+func getTypeFieldOffset[T any](field string) uintptr {
+	var v T
+	t := reflect.TypeOf(v)
+	sf, ok := t.FieldByName(field)
+	if !ok {
+		panic(t.String() + ": unknown field: " + field)
+	}
+	return sf.Offset
+}
+
+var (
+	devicePeersOffset  = getTypeFieldOffset[device.Device]("peers")
+	peerStatsOffset    = getTypeFieldOffset[device.Peer]("stats")
+	peerRWMutexOffset  = getTypeFieldOffset[device.Peer]("RWMutex")
+	peerEndpointOffset = getTypeFieldOffset[device.Peer]("endpoint")
+)
+
+func networkLoggerOld(wgdev *device.Device, logf logger.Logf) {
+	type peerMapType struct {
+		sync.RWMutex // protects keyMap
+		keyMap       map[device.NoisePublicKey]*device.Peer
+	}
+	type peerStatsType struct {
+		txBytes           uint64 // bytes send to peer (endpoint)
+		rxBytes           uint64 // bytes received from peer
+		lastHandshakeNano int64  // nano seconds since epoch
+	}
+
+	for range time.Tick(time.Second) {
+		func() {
+			logf("DATALOG START")
+			defer logf("DATALOG END")
+
+			peers := (*peerMapType)(unsafe.Add(unsafe.Pointer(wgdev), devicePeersOffset))
+			peers.RLock()
+			defer peers.RUnlock()
+
+			for _, peer := range peers.keyMap {
+				func() {
+					mu := (*sync.RWMutex)(unsafe.Add(unsafe.Pointer(peer), peerRWMutexOffset))
+					mu.RLock()
+					defer mu.RUnlock()
+
+					endpoint := *(*conn.Endpoint)(unsafe.Add(unsafe.Pointer(peer), peerEndpointOffset))
+
+					stats := (*peerStatsType)(unsafe.Add(unsafe.Pointer(peer), peerStatsOffset))
+
+					txBytes := atomic.LoadUint64(&stats.txBytes)
+					rxBytes := atomic.LoadUint64(&stats.rxBytes)
+					logf("%s: tx:%d rx:%d", endpoint.DstToString(), txBytes, rxBytes)
+				}()
+			}
+		}()
+	}
 }
 
 // echoRespondToAll is an inbound post-filter responding to all echo requests.

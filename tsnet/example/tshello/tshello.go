@@ -45,6 +45,7 @@ func main() {
 			html.EscapeString(who.UserProfile.LoginName),
 			html.EscapeString(firstLabel(who.Node.ComputedName)),
 			r.RemoteAddr)
+		fmt.Fprintf(w, strings.Repeat("the quick brown fox jumped over the lazy dog<br>", 1000))
 	})))
 }
 
